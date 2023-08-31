@@ -1,0 +1,252 @@
+# from phi.tf.flow import *
+from phi.torch.flow import *
+# from phi.jax.stax.flow import *
+# from phi._troubleshoot import plot_solves
+
+
+pos_y = 0.6
+x0 = vec(x=0.4, y=pos_y)
+speed = 1
+num_key_states = 15
+num_trj_frames = 60
+layers = 4 #billiards_layers
+# num_input_dense = 2*(num_key_states + 1)*((1 + 2 + 3 + 4) + 1)
+parm_1_min = -PI/6
+parm_1_max =  PI/6
+parm_2_min = 0.5
+parm_2_max =  0.8
+# noise_scale_1= 0.18
+# noise_scale_2= 0.28
+# skew_scale_high= 3
+# skew_scale_low= 0.1
+# num_train_steps = 5000
+
+
+def billiards_triangle(billiard_layers=layers, radius=.03):
+    coords = []
+    for i in range(billiard_layers):
+        for j in range(i + 1):
+            coords.append(vec(x=i * 2.4 * radius + 0.6, y=j * 2.4 * radius + 0.6 - i * radius * 0.7))
+    return Sphere(stack(coords, instance('balls')), radius=radius)
+
+
+plot(billiards_triangle())
+math.print(billiards_triangle())
+
+
+def physics_step(v: PointCloud, time: float or Tensor, elasticity=.8, friction=0.5):
+  other_points = rename_dims(v.points, 'balls', 'others') #Another dimension 'others' to compute pairwise quantities.
+  rel_v = v.values - rename_dims(v.values, 'balls', 'others') #Pairwise relative velocities of balls
+  t_to_closest = (other_points - v.points).vector * rel_v.vector / math.vec_squared(rel_v)  #assuming linear velocity
+  closest = v.points + t_to_closest * rel_v #Are these coordinates to closest approach from ball i to ball j. If collision occurs then it is the coordinates of collision? WHy have we added v.points?
+  pass_by_distance_squared = math.vec_squared(closest - other_points)  # will impact if < 2 R, otherwise neg_offset will be NaN
+  radius_sum = v.elements.radius + rename_dims(v.elements.radius, 'balls', 'others') #This will always be 0.12?
+  impact_offset = math.sqrt(radius_sum ** 2 - pass_by_distance_squared)  #positive, distance by how much the impact happens before the closest point on the line
+  impact_time_no_friction = t_to_closest - impact_offset / math.vec_length(rel_v, eps=1e-5)  #assuming linear velocity
+  impact_time = - math.log(1 - friction * impact_time_no_friction) / friction
+  impact_time = math.where(impact_time < 1e-3, NAN, impact_time)
+  first_impact_time = math.finite_min(impact_time, default=INF)
+  friction_factor = math.exp(- first_impact_time * friction)
+  has_impact = impact_time <= first_impact_time + 1e-3  #Handle simultaneous collisions in one go
+  impact_relative_position = other_points - (v.points + impact_time_no_friction * rel_v)
+  rel_v_at_impact = rel_v * friction_factor
+  impulse = -(1 + elasticity) * .5 * (rel_v_at_impact.vector * impact_relative_position.vector) * impact_relative_position / math.vec_squared(impact_relative_position)
+  travel_distance = v.values / friction * (1 - friction_factor)
+  v = v.with_elements(v.elements.shifted(travel_distance))  #Update position
+  v *= friction_factor  #Deceleration due to friction
+  v += math.finite_sum(math.where(has_impact, impulse, 0), 'others')  #transfer momentum in case collision occurs
+  return v, time + first_impact_time #physics_step returns v after each iteration.
+
+
+def sample_linear_trajectory(states: PointCloud, times: Tensor, time_dim: math.Shape, velocity_threshold=.1, friction=.5):
+  max_velocity = math.max(math.vec_length(states.keys[0].values))
+  max_time = math.log(max_velocity / velocity_threshold) / friction
+  indices = math.range(spatial('keys'), states.keys.size)
+  lin_t = math.linspace(0, max_time, time_dim)
+  key_i = math.max(math.where(times <= lin_t, indices, -1), 'keys')
+  prev_vel = states.values.keys[key_i]
+  prev_pos = states.points.keys[key_i]
+  prev_time = times.keys[key_i]
+  dt = lin_t - prev_time
+  friction_factor = math.exp(- dt * friction)
+  travel_distance = prev_vel / friction * (1 - friction_factor)
+  new_pos = prev_pos + travel_distance
+  new_velocities = prev_vel * friction_factor
+  return PointCloud(Sphere(new_pos, radius=states.elements.radius[{'keys': 0}]), new_velocities), lin_t
+
+
+
+balls = billiards_triangle()
+cue_ball = Sphere(tensor([(x0)],instance('balls'), channel(vector='x,y')), radius=.03)
+
+alpha_test = math.random_uniform(low=parm_1_min, high=parm_1_max)
+# alpha_test = 0
+math.print(alpha_test)
+
+pos_y_test = math.random_uniform(low=parm_2_min, high=parm_2_max)
+math.print(pos_y_test)
+
+x0_test = vec(x=0.4, y=pos_y_test)
+v0_speed = speed
+math.print(x0_test)
+math.print(v0_speed)
+
+
+cue_ball_test = Sphere(tensor([x0_test], instance('balls'), channel(vector='x,y')), radius=.03)
+all_balls_test = math.concat([cue_ball_test, balls], instance('balls'))
+print(cue_ball_test)
+math.print(all_balls_test)
+
+v0_test = vec(x=v0_speed * math.cos(alpha_test), y=v0_speed * math.sin(alpha_test))
+cue_ball_v_test = PointCloud(cue_ball_test, tensor([(v0_test)], shape(cue_ball))) ##################
+# math.print(v0_test)
+# math.print(cue_ball_v_test)
+
+balls_v_test = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0)], shape(balls)))
+all_balls_v_test = math.concat([cue_ball_v_test, balls_v_test], instance('balls'))
+# print(all_balls_v_test)
+# print(all_balls_v_test.shape)
+# math.print(all_balls_v_test)
+
+key_states_test, key_times_test = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_test, 0)
+trj_test, _ = sample_linear_trajectory(key_states_test, key_times_test, spatial(t=num_trj_frames))
+# math.print(key_states_test)
+
+
+
+def landscape(alpha, pos_y):
+  balls = billiards_triangle()
+  # alpha = alpha_test
+  pos_x = 0.4
+  # pos_y = pos_y_test
+  v0_speed = speed
+  x0 = vec(x=pos_x, y=pos_y)
+  cue_ball = Sphere(tensor([(x0)],instance('balls'), channel(vector='x,y')), radius=.03)
+  all_balls = math.concat([cue_ball, balls], instance('balls'))
+  # balls_v = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0)], shape(balls)))
+  balls_v = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0)], shape(balls)))
+  v0 = vec(x=v0_speed * math.cos(alpha), y=v0_speed * math.sin(alpha))
+  cue_ball_v = PointCloud(cue_ball, tensor([(v0)], shape(cue_ball_test)))
+  all_balls_v = math.concat([cue_ball_v, balls_v], instance('balls'))
+  key_states, key_times = iterate(physics_step, spatial(keys=num_key_states), all_balls_v, 0)
+  trj, _ = sample_linear_trajectory(key_states, key_times, spatial(t=num_trj_frames))
+  # trj_test, _ = sample_linear_trajectory(key_states_test, key_times_test, spatial(t=num_trj_frames))
+  return math.l2_loss(trj.elements.center - trj_test.elements.center)
+
+
+show({"Ground Truth": CenteredGrid(lambda alpha, pos_y: landscape(alpha, pos_y), alpha = 200, pos_y = 200, bounds=Box(alpha=(parm_1_min,parm_1_max), pos_y=(parm_2_min,parm_2_max)))})
+show({"Ground Truth_sliced_Vs_alpha": CenteredGrid(lambda alpha: landscape(alpha, pos_y=pos_y_test), alpha = 1000, bounds=Box(alpha=(parm_1_min,parm_1_max)))})
+show({"Ground Truth_sliced_vs_pos_y": CenteredGrid(lambda pos_y: landscape(alpha_test, pos_y), pos_y = 1000, bounds=Box(pos_y=(parm_2_min,parm_2_max)))})
+
+
+
+
+surrogate_net = conv_net(4, 1, [64, 128, 128, 64], activation='ReLU', in_spatial=2)
+optimizer_s = adam(surrogate_net)
+math.print(parameter_count(surrogate_net))
+
+def training_loss_s(X):
+  predicted_loss = math.native_call(surrogate_net, X)
+  return math.l2_loss(predicted_loss - config_loss), X, predicted_loss
+
+
+
+batch_size = 16
+for steps in range(5000):
+  balls = billiards_triangle()
+  v0_speed = speed
+  pos_y_ref = math.random_uniform(batch(b=batch_size), low=parm_2_min, high=parm_2_max)
+  pos_y_train = math.random_uniform(batch(b=batch_size), low=parm_2_min, high=parm_2_max)
+  alpha_ref = math.random_uniform(batch(b=batch_size), low=parm_1_min, high=parm_1_max)
+  alpha_train = math.random_uniform(batch(b=batch_size), low=parm_1_min, high=parm_1_max)
+  # print(f"alpha_ref: {alpha_ref}")
+  # print(f"alpha_train: {alpha_train}")
+  x0_ref = vec(x=0.4, y=pos_y_ref)
+  x0_train = vec(x=0.4, y=pos_y_train)
+  cue_ball_ref = Sphere(tensor([x0_ref], instance('balls'), channel(vector='x,y')), radius=.03)
+  cue_ball_train = Sphere(tensor([x0_train], instance('balls'), channel(vector='x,y')), radius=.03)
+  all_balls_ref = math.concat([cue_ball_ref, balls], instance('balls'))
+  all_balls_train = math.concat([cue_ball_train, balls], instance('balls'))
+  balls_v = PointCloud(balls, tensor([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
+                                     shape(balls)))
+  v0_ref = vec(x=v0_speed * math.cos(alpha_ref), y=v0_speed * math.sin(alpha_ref))
+  v0_train = vec(x=v0_speed * math.cos(alpha_train), y=v0_speed * math.sin(alpha_train))
+  cue_ball_v_ref = PointCloud(cue_ball_ref, tensor([(v0_ref)], shape(cue_ball_test)))
+  cue_ball_v_train = PointCloud(cue_ball_train, tensor([(v0_train)], shape(cue_ball_test)))
+  all_balls_v_ref = math.concat([cue_ball_v_ref, balls_v], instance('balls'))
+  all_balls_v_train = math.concat([cue_ball_v_train, balls_v], instance('balls'))
+  key_states_ref, key_times_ref = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_ref, 0)
+  key_states_train, key_times_train = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_train, 0)
+  trj_ref, _ = sample_linear_trajectory(key_states_ref, key_times_ref, spatial(t=num_trj_frames))
+  trj_train, _ = sample_linear_trajectory(key_states_train, key_times_train, spatial(t=num_trj_frames))  # Batch dimension aate hi is line me problem hai
+
+  config_loss = math.l2_loss(trj_train.elements.center - trj_ref.elements.center)
+  # math.print(config_loss)
+
+
+  input_nn = math.rename_dims(trj_ref.elements.center, instance('balls'), spatial('balls'))
+  # input_nn_v = math.rename_dims(trj_ref.values, instance('balls'), spatial('balls'))
+  input_alpha = math.expand(alpha_train, shape(input_nn.vector[0]))
+  input_pos_y = math.expand(pos_y_train, shape(input_nn.vector[0]))
+  # input_nn_surrogate = math.stack([input_nn.vector[0], input_nn_v.vector[0], input_nn.vector[1], input_nn_v.vector[1], input_alpha], channel(features='input_pos_x,input_vel_x, input_pos_y,input_vel_y, input_alpha'))
+  # input_nn_ss = math.stack([input_nn.vector[0], input_nn_v.vector[0], input_nn.vector[1], input_nn_v.vector[1], input_alpha + noise_scale_1 * noise],channel(features='input_pos_x,input_vel_x, input_pos_y,input_vel_y, input_alpha'))
+  input_nn_surrogate = math.stack([input_nn.vector[0], input_nn.vector[1], input_alpha, input_pos_y], channel(features='input_pos_x, input_pos_y, input_alpha,input_pos_y '))
+  # input_nn_ss = math.stack([input_nn.vector[0], input_nn.vector[1], input_alpha + noise_scale_1 * noise],channel(features='input_pos_x, input_pos_y, input_alpha'))
+
+
+  loss_surrogate, _, _ = update_weights(surrogate_net, optimizer_s, training_loss_s, input_nn_surrogate)
+
+  if steps % 100 == 0:
+    print(f"Config_loss: {config_loss}")
+    print(f"Predicted_NN: {math.mean(math.native_call(surrogate_net, input_nn_surrogate))}")
+    print(f"Training_loss_NN: {loss_surrogate}")
+  # loss_ss, _, _ = update_weights(ss_net, optimizer_ss, training_loss_ss, input_nn_ss)
+  # loss_bs, _, _ = update_weights(bs_net, optimizer_bs, training_loss_bs, input_nn_surrogate)
+  # loss_bss, _, _ = update_weights(bss_net, optimizer_bss, training_loss_bss, input_nn_ss)
+
+  # training_loss_surrogate_list.append(loss_surrogate)
+
+
+  # k = num_train_steps / 10
+
+
+
+
+save_state(surrogate_net, './billiards_s_27082023.pth')
+
+
+
+def plot_fn(alpha, pos_y):
+    balls = billiards_triangle()
+    # alpha = alpha_test
+    pos_x = 0.4
+    # pos_y = pos_y_test
+    v0_speed = speed
+    x0 = vec(x=pos_x, y=pos_y)
+    cue_ball = Sphere(tensor([(x0)], instance('balls'), channel(vector='x,y')), radius=.03)
+    all_balls = math.concat([cue_ball, balls], instance('balls'))
+    # balls_v = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0)], shape(balls)))
+    balls_v = PointCloud(balls, tensor([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
+                                       shape(balls)))
+    v0 = vec(x=v0_speed * math.cos(alpha), y=v0_speed * math.sin(alpha))
+    cue_ball_v = PointCloud(cue_ball, tensor([(v0)], shape(cue_ball_test)))
+    all_balls_v = math.concat([cue_ball_v, balls_v], instance('balls'))
+    key_states, key_times = iterate(physics_step, spatial(keys=num_key_states), all_balls_v, 0)
+    trj, _ = sample_linear_trajectory(key_states, key_times, spatial(t=num_trj_frames))
+    # trj_test, _ = sample_linear_trajectory(key_states_test, key_times_test, spatial(t=num_trj_frames))
+    input_net = math.rename_dims(trj_test.elements.center, instance('balls'), spatial('balls'))
+    input_alpha = math.expand(alpha, shape(input_net.vector[0]))
+    input_pos_y = math.expand(pos_y, shape(input_net.vector[0]))
+    input_nn_surrogate = math.stack([input_net.vector[0],input_net.vector[1], input_alpha,input_pos_y], channel(features='input_pos_x, input_pos_y, input_alpha, input_pos_y'))
+
+    return math.l2_loss(trj.elements.center - trj_test.elements.center), math.mean(math.native_call(surrogate_net, input_nn_surrogate))
+
+
+
+
+show(CenteredGrid(lambda alpha, pos_y: plot_fn(alpha, pos_y)[0], alpha=100, pos_y=50,
+                  bounds=Box(alpha=(parm_1_min, parm_1_max), pos_y=(parm_2_min, parm_2_max))))
+show(CenteredGrid(lambda alpha, pos_y: plot_fn(alpha, pos_y)[1], alpha=100, pos_y=50,
+                  bounds=Box(alpha=(parm_1_min, parm_1_max), pos_y=(parm_2_min, parm_2_max))))
+
+
