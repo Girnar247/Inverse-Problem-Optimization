@@ -1,0 +1,145 @@
+from phi.torch.flow import *
+
+
+pos_y = 0.6
+x0 = vec(x=0.4, y=pos_y)
+speed = 1
+num_key_states = 15
+num_trj_frames = 60
+layers = 4 #billiards_layers
+# num_input_dense = 2*(num_key_states + 1)*((1 + 2 + 3 + 4) + 1)
+parm_1_min = -PI/11
+parm_1_max =  PI/7
+parm_2_min = 0.5
+parm_2_max =  0.8
+noise_scale_1= 0.18
+# noise_scale_2= 0.28
+# skew_scale_high= 3
+# skew_scale_low= 0.1
+num_train_steps = 5000
+
+
+def billiards_triangle(billiard_layers=layers, radius=.03):
+    coords = []
+    for i in range(billiard_layers):
+        for j in range(i + 1):
+            coords.append(vec(x=i * 2.4 * radius + 0.6, y=j * 2.4 * radius + 0.6 - i * radius * 0.7))
+    return Sphere(stack(coords, instance('balls')), radius=radius)
+
+
+# plot(billiards_triangle())
+# math.print(billiards_triangle())
+
+
+def grad_nan_to_0(v):
+    def backward(fwd_args: dict, _y, dy):
+        return {tuple(fwd_args)[0]: math.where(math.is_finite(dy), dy, 0)}
+    return math.custom_gradient(math.identity, backward)(v)
+
+
+def physics_step(v: PointCloud, time: float or Tensor, elasticity=.8, friction=.5):
+    """
+    Simulate ball
+
+    Args:
+        v: State of the system as `PointCloud` containing `Sphere` elements and holding the corresponding velocities as values.
+        time: Initial time.
+        elasticity: Collision elasticity.
+        friction: Unit 1/time.  v(t) = v0 * exp(-k*t).  x(t) = x0 + v0 * (1 - exp(-k*t) / k
+
+    Returns:
+        v: Next state as `PointCloud`
+        time: Corresponding simulation time.
+    """
+    other_points = math.si2d(v.points)
+    rel_v = grad_nan_to_0(v.values - math.si2d(v.values))
+    distance = grad_nan_to_0(other_points - v.points)
+    t_to_closest = grad_nan_to_0(distance.vector * rel_v.vector / math.vec_squared(rel_v))  # assuming linear velocity, NaN on diagonal
+    closest = v.points + t_to_closest * rel_v  # NaN on diagonal, grad=0
+    pass_by_distance_squared = math.vec_squared(grad_nan_to_0(closest - other_points))  # will impact if < 2 R, otherwise neg_offset will be NaN
+    radius_sum = v.elements.radius + math.si2d(v.elements.radius)
+    impact_offset = math.sqrt(radius_sum ** 2 - pass_by_distance_squared)  # positive, distance by how much the impact happens before the closest point on the line
+    impact_time_no_friction = grad_nan_to_0(t_to_closest - impact_offset / math.vec_length(rel_v, eps=1e-5))  # assuming linear velocity, NaN
+    impact_time = - math.log(1 - friction * impact_time_no_friction) / friction
+    impact_time = math.where(impact_time < 1e-3, NAN, impact_time)
+    first_impact_time = math.finite_min(impact_time, default=INF)
+    friction_factor = math.exp(- first_impact_time * friction)
+    has_impact = impact_time <= first_impact_time + 1e-3  # Handle simultaneous collisions in one go
+    impact_relative_position = grad_nan_to_0(other_points - (v.points + impact_time_no_friction * rel_v))
+    rel_v_at_impact = rel_v * friction_factor
+    impulse = -(1 + elasticity) * .5 * (rel_v_at_impact.vector * impact_relative_position.vector) * impact_relative_position / math.vec_squared(impact_relative_position)
+    travel_distance = v.values / friction * (1 - friction_factor)  # passes NaN to v_values
+    v = v.with_elements(v.elements.at(v.points + travel_distance))  # Update position
+    impact = math.sum(math.where(has_impact, impulse, 0), dual)
+    v = v.with_values(v.values * friction_factor + impact)  # Deceleration
+    return v, time + first_impact_time
+
+
+
+def sample_linear_trajectory(states: PointCloud, times: Tensor, time_dim: math.Shape, velocity_threshold=.1, friction=.5):
+  max_velocity = math.max(math.vec_length(states.keys[0].values))
+  max_time = math.log(max_velocity / velocity_threshold) / friction
+  indices = math.range(spatial('keys'), states.keys.size)
+  lin_t = math.linspace(0, max_time, time_dim)
+  key_i = math.max(math.where(times <= lin_t, indices, -1), 'keys')
+  prev_vel = states.values.keys[key_i]
+  prev_pos = states.points.keys[key_i]
+  prev_time = times.keys[key_i]
+  dt = lin_t - prev_time
+  friction_factor = math.exp(- dt * friction)
+  travel_distance = prev_vel / friction * (1 - friction_factor)
+  new_pos = prev_pos + travel_distance
+  new_velocities = prev_vel * friction_factor
+  return PointCloud(Sphere(new_pos, radius=states.elements.radius[{'keys': 0}]), new_velocities), lin_t
+
+
+
+balls = billiards_triangle()
+cue_ball = Sphere(tensor([x0], instance('balls'), channel(vector='x,y')), radius=.03)
+all_balls = math.concat([cue_ball, balls], instance('balls'))
+balls_v = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0)], shape(balls)))
+
+
+alpha = 0 #Collisions occur in range [-PI/11, PI/7]
+math.print(alpha)
+v0 = vec(x=speed * math.cos(alpha), y=speed * math.sin(alpha))
+cue_ball_v = PointCloud(cue_ball, tensor([(v0)], shape(cue_ball)))
+all_balls_v = math.concat([cue_ball_v, balls_v], instance('balls'))
+
+
+v0 = vec(x=speed * math.cos(alpha), y=speed * math.sin(alpha))
+cue_ball_v = PointCloud(cue_ball, tensor([(v0)], shape(cue_ball)))
+all_balls_v = math.concat([cue_ball_v, balls_v], instance('balls'))
+
+
+key_states, key_times = iterate(physics_step, spatial(keys=num_key_states), all_balls_v, 0)
+
+trj, _ = sample_linear_trajectory(key_states, key_times, spatial(t=num_trj_frames))
+
+
+show(key_states.elements)
+
+
+
+alpha_true = math.random_uniform(low=parm_1_min, high=parm_1_max)
+math.print(alpha_true)
+
+v0_true = vec(x=speed * math.cos(alpha_true), y=speed * math.sin(alpha_true))
+cue_ball_v_true = PointCloud(cue_ball, tensor([(v0_true)], shape(cue_ball)))
+all_balls_v_true = math.concat([cue_ball_v_true, balls_v], instance('balls'))
+
+key_states_true, key_times_true = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_true, 0)
+trj_true, _ = sample_linear_trajectory(key_states_true, key_times_true, spatial(t=num_trj_frames))
+
+show(key_states_true.elements)
+
+def config_loss(alpha):
+  v0_rand = vec(x=speed * math.cos(alpha), y=speed * math.sin(alpha))
+  cue_ball_v_rand = PointCloud(cue_ball, tensor([(v0_rand)], shape(cue_ball)))
+  all_balls_v_rand = math.concat([cue_ball_v_rand, balls_v], instance('balls'))
+  key_states_rand, key_times_rand = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_rand, 0)
+  trj_rand, _ = sample_linear_trajectory(key_states_rand, key_times_rand, spatial(t=num_trj_frames))
+  return math.l2_loss(trj_true.elements.center - trj_rand.elements.center)
+
+show(CenteredGrid(lambda alpha: config_loss(alpha), alpha=1000, bounds=Box(alpha=(parm_1_min,parm_1_max))))
+
