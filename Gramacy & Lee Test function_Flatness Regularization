@@ -1,0 +1,107 @@
+from phi.tf.flow import *
+
+#Hyperparameters
+lr = 1.0e-4
+lr2 = 1.1e-5
+flat_lambda = 0.01
+num_train_steps = 1000
+batch_size = 1200
+
+
+def test(x):
+    # return math.sin(x)
+    return math.sin(10*PI*x)/(2*x) + (x -1)**4
+
+grad_test = math.functional_gradient(test, wrt = 'x',get_output=False)
+
+show(CenteredGrid(lambda x: test(x), x=1000, bounds=Box(x=(-1, 3))))
+
+show(CenteredGrid(lambda x: grad_test(x), x=500, bounds=Box(x=(-1, 3))))
+
+surrogate = dense_net(1, 1, [64, 128,256, 128, 64], activation='ReLU')
+optimizer_s = adam(surrogate, learning_rate=lr)
+ss = dense_net(1, 1, [64, 128,256, 128, 64], activation='ReLU')
+optimizer_ss = adam(ss,learning_rate=lr)
+flat_s = dense_net(1, 1, [64, 128,256, 128, 64], activation='ReLU')
+optimizer_fs = adam(flat_s, learning_rate=lr2)
+
+# from keras.src.backend import l2_normalize
+# import torch
+def loss_function_s(X):
+    prediction_s = math.native_call(surrogate, X)
+    return math.l2_loss(prediction_s - test(X)), X, prediction_s
+
+def loss_function_ss(X):
+    prediction_ss = math.native_call(ss, X + 0.2*b)
+    return math.l2_loss(prediction_ss - test(X)), X, prediction_ss
+
+def loss_function(x):
+    prediction = math.native_call(flat_s, x)
+    loss = math.l2_loss(prediction - test(x))
+    return loss, prediction
+
+def loss_function_flat(X):
+    loss_normal, prediction_fs = loss_function(X)
+    dx = math.functional_gradient(loss_function, 'x', get_output=False)
+    loss_reg = flat_lambda*math.l2_loss(dx(X))
+    return  loss_normal + loss_reg, loss_normal, loss_reg, X, prediction_fs
+
+def plot_fn(X):
+  return test(X), math.native_call(surrogate, X), math.native_call(ss, X),math.native_call(flat_s, X)
+
+
+
+load_state(surrogate, 'surrogate.pth')
+load_state(ss, 'ss.pth')
+load_state(flat_s, 'flat_s.pth')
+
+loss1_list = []
+trj_fn = []
+trj_loss = []
+for training_step in range(num_train_steps):
+    a = math.random_uniform(batch(examples=batch_size), high=3, low=-1)
+    b = math.random_normal(batch(examples=batch_size)) #noise
+
+    # loss1, _, _ = update_weights(surrogate, optimizer_s, loss_function_s, a)
+    # loss2, _, _ = update_weights(ss, optimizer_ss, loss_function_ss, a)
+    loss3,loss_norm,loss_reg, _, _ = update_weights(flat_s, optimizer_fs, loss_function_flat, a)
+
+    # loss1_list.append(loss1)
+
+    n = num_train_steps/ 10
+
+
+    # if training_step % n == 0: trj1.append(
+    #     CenteredGrid(lambda X: math.native_call(surrogate, X), x=200, bounds=Box(x=(-4, 4))))
+    if training_step % n == 0:
+        # math.print(a)
+        # math.print(b)
+        print(f"Final loss1: {loss3}")
+        print(f"Flatness loss: {loss3, loss_norm, loss_reg}")
+        # trj_loss.append((CenteredGrid(lambda x: math.stack({"Loss total": loss_function_flat(x)[0], "Loss normal": loss_function_flat(x)[1],"Loss reg": loss_function_flat(x)[2], "Fuction": test(x)}, channel('curves')), x=3000, bounds=Box(x=(-1, 3)))))
+        # trj_fn.append((CenteredGrid(
+    # lambda x: math.stack({"Ground Truth": plot_fn(x)[0], "Surrogate Predicted": plot_fn(x)[1], "SS Predicted": plot_fn(x)[2], "FS Predicted": plot_fn(x)[3]},
+    #                      channel('curves')), x=3000, bounds=Box(x=(-1, 3)))))
+        vis.show(CenteredGrid(lambda x: math.stack({"Loss total": loss_function_flat(x)[0], "Loss normal": loss_function_flat(x)[1],"Loss reg": loss_function_flat(x)[2], "Fuction": test(x)}, channel('curves')), x=3000, bounds=Box(x=(-1, 3))))
+        vis.show(CenteredGrid(
+    lambda x: math.stack({"Ground Truth": plot_fn(x)[0], "Surrogate Predicted": plot_fn(x)[1], "SS Predicted": plot_fn(x)[2], "FS Predicted": plot_fn(x)[3]},
+                         channel('curves')), x=3000, bounds=Box(x=(-1, 3))))
+
+# save_state(surrogate, 'surrogate.pth')
+# save_state(ss, 'ss.pth')
+save_state(flat_s, 'flat_s.pth')
+
+load_state(surrogate, 'surrogate.pth')
+load_state(ss, 'ss.pth')
+load_state(flat_s, 'flat_s.pth')
+
+
+vis.show(CenteredGrid(
+    lambda x: math.stack({"Ground Truth": plot_fn(x)[0], "Surrogate Predicted": plot_fn(x)[1], "SS Predicted": plot_fn(x)[2], "FS Predicted": plot_fn(x)[3]},
+                         channel('curves')), x=3000, bounds=Box(x=(-1, 3))))
+#
+# trj_fn_an = math.stack(trj_fn, batch('time'))
+# vis.show(trj_fn_an, animate='time')
+#
+# trj_loss_an = math.stack(trj_loss, batch('time'))
+# vis.show(trj_loss, animate='time')
