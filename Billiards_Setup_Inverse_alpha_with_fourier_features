@@ -1,0 +1,354 @@
+    # from phi.jax.flow import *
+    from phi.tf.flow import *
+    #from phi.torch.flow import *
+
+
+    pos_y = 0.6
+    x0 = vec(x=0.4, y=pos_y)
+    speed = 1
+    num_key_states = 15
+    num_trj_frames = 60
+    layers = 4 #billiards_layers
+    # num_input_dense = 2*(num_key_states + 1)*((1 + 2 + 3 + 4) + 1)
+    parm_1_min = -PI/11
+    parm_1_max =  PI/7
+    parm_2_min = 0.5
+    parm_2_max =  0.8
+    noise_scale= 0.11
+    noise_scale_2= 0.28
+    flat_lambda = 0.001
+    skew_scale_high= 2.7
+    skew_scale_low= 0.1
+    num_train_steps = 5000 #Total 6k for #FlatS_FF works well with only 1k training steps
+
+    def billiards_triangle(billiard_layers=layers, radius=.03):
+        coords = []
+        for i in range(billiard_layers):
+            for j in range(i + 1):
+                coords.append(vec(x=i * 2.4 * radius + 0.6, y=j * 2.4 * radius + 0.6 - i * radius * 0.7))
+        return Sphere(stack(coords, instance('balls')), radius=radius)
+
+
+    plot(billiards_triangle())
+    math.print(billiards_triangle())
+
+    def grad_nan_to_0(v):
+        def backward(fwd_args: dict, _y, dy):
+            return {tuple(fwd_args)[0]: math.where(math.is_finite(dy), dy, 0)}
+        return math.custom_gradient(math.identity, backward)(v)
+    def physics_step(v: PointCloud, time: float or Tensor, elasticity=.8, friction=.5):
+        """
+        Simulate ball
+
+        Args:
+            v: State of the system as `PointCloud` containing `Sphere` elements and holding the corresponding velocities as values.
+            time: Initial time.
+            elasticity: Collision elasticity.
+            friction: Unit 1/time.  v(t) = v0 * exp(-k*t).  x(t) = x0 + v0 * (1 - exp(-k*t) / k
+
+        Returns:
+            v: Next state as `PointCloud`
+            time: Corresponding simulation time.
+        """
+        other_points = math.si2d(v.points)
+        rel_v = grad_nan_to_0(v.values - math.si2d(v.values))
+        distance = grad_nan_to_0(other_points - v.points)
+        t_to_closest = grad_nan_to_0(distance.vector * rel_v.vector / math.vec_squared(rel_v))  # assuming linear velocity, NaN on diagonal
+        closest = v.points + t_to_closest * rel_v  # NaN on diagonal, grad=0
+        pass_by_distance_squared = math.vec_squared(grad_nan_to_0(closest - other_points))  # will impact if < 2 R, otherwise neg_offset will be NaN
+        radius_sum = v.elements.radius + math.si2d(v.elements.radius)
+        impact_offset = math.sqrt(radius_sum ** 2 - pass_by_distance_squared)  # positive, distance by how much the impact happens before the closest point on the line
+        impact_time_no_friction = grad_nan_to_0(t_to_closest - impact_offset / math.vec_length(rel_v, eps=1e-5))  # assuming linear velocity, NaN
+        impact_time = - math.log(1 - friction * impact_time_no_friction) / friction
+        impact_time = math.where(impact_time < 1e-3, NAN, impact_time)
+        first_impact_time = math.finite_min(impact_time, default=INF)
+        friction_factor = math.exp(- first_impact_time * friction)
+        has_impact = impact_time <= first_impact_time + 1e-3  # Handle simultaneous collisions in one go
+        impact_relative_position = grad_nan_to_0(other_points - (v.points + impact_time_no_friction * rel_v))
+        rel_v_at_impact = rel_v * friction_factor
+        impulse = -(1 + elasticity) * .5 * (rel_v_at_impact.vector * impact_relative_position.vector) * impact_relative_position / math.vec_squared(impact_relative_position)
+        travel_distance = v.values / friction * (1 - friction_factor)  # passes NaN to v_values
+        v = v.with_elements(v.elements.at(v.points + travel_distance))  # Update position
+        impact = math.sum(math.where(has_impact, impulse, 0), dual)
+        v = v.with_values(v.values * friction_factor + impact)  # Deceleration
+        return v, time + first_impact_time
+    def sample_linear_trajectory(states: PointCloud, times: Tensor, time_dim: math.Shape, velocity_threshold=.1, friction=.5):
+      max_velocity = math.max(math.vec_length(states.keys[0].values))
+      max_time = math.log(max_velocity / velocity_threshold) / friction
+      indices = math.range(spatial('keys'), states.keys.size)
+      lin_t = math.linspace(0.0, max_time, time_dim)
+      key_i = math.max(math.where(times <= lin_t, indices, -1), 'keys')
+      prev_vel = states.values.keys[key_i]
+      prev_pos = states.points.keys[key_i]
+      prev_time = times.keys[key_i]
+      dt = lin_t - prev_time
+      friction_factor = math.exp(- dt * friction)
+      travel_distance = prev_vel / friction * (1 - friction_factor)
+      new_pos = prev_pos + travel_distance
+      new_velocities = prev_vel * friction_factor
+      return PointCloud(Sphere(new_pos, radius=states.elements.radius[{'keys': 0}]), new_velocities), lin_t
+
+
+    balls = billiards_triangle()
+    cue_ball = Sphere(tensor([x0], instance('balls'), channel(vector='x,y')), radius=.03)
+    all_balls = math.concat([cue_ball, balls], instance('balls'))
+    balls_v = PointCloud(balls, tensor([(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0),(0, 0)], shape(balls)))
+
+    alpha_true = math.random_uniform(low=parm_1_min, high=parm_1_max)
+    math.print(alpha_true)
+
+    v0_true = vec(x=speed * math.cos(alpha_true), y=speed * math.sin(alpha_true))
+    cue_ball_v_true = PointCloud(cue_ball, tensor([(v0_true)], shape(cue_ball)))
+    all_balls_v_true = math.concat([cue_ball_v_true, balls_v], instance('balls'))
+
+    key_states_true, key_times_true = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_true, 0)
+    trj_true, _ = sample_linear_trajectory(key_states_true, key_times_true, spatial(t=num_trj_frames))
+
+    show(key_states_true.elements)
+
+    def config_loss(alpha):
+      v0_rand = vec(x=speed * math.cos(alpha), y=speed * math.sin(alpha))
+      cue_ball_v_rand = PointCloud(cue_ball, tensor([(v0_rand)], shape(cue_ball)))
+      all_balls_v_rand = math.concat([cue_ball_v_rand, balls_v], instance('balls'))
+      key_states_rand, key_times_rand = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_rand, 0)
+      trj_rand, _ = sample_linear_trajectory(key_states_rand, key_times_rand, spatial(t=num_trj_frames))
+      return math.l2_loss(trj_true.elements.center - trj_rand.elements.center)
+
+    grad = math.functional_gradient(lambda alpha: config_loss(alpha), 'alpha', get_output=False)
+
+    # show(CenteredGrid(lambda alpha: grad(alpha), alpha=100, bounds=Box(alpha=(parm_1_min,parm_1_max))))
+    #
+    # show(CenteredGrid(lambda alpha: config_loss(alpha), alpha=100, bounds=Box(alpha=(parm_1_min,parm_1_max))))
+    #
+    # show(CenteredGrid(lambda alpha: math.stack({"Ground Truth Configuration loss": config_loss(alpha),"gradients": grad(alpha)}, channel('curves')), alpha=300, bounds=Box(alpha=(-PI/11, PI/7))), size=(15,7), title='Network Outputs')
+
+    surrogate_ff = conv_net(40, 1, [64,128,256, 128,64], activation='ReLU', in_spatial=2)
+    surrogate_ff2 = conv_net(80, 1, [64,128,256, 128,64], activation='ReLU', in_spatial=2)
+    ss_ff = conv_net(40, 1, [64,128,256,128,64], activation='ReLU', in_spatial=2)
+    bs_ff = conv_net(40, 1, [64,128,256,128,64], activation='ReLU', in_spatial=2)
+    bss_ff = conv_net(40, 1, [64,128,256,128,64], activation='ReLU', in_spatial=2)
+    fs_ff = conv_net(40, 1, [64,128,256,128,64], activation='ReLU', in_spatial=2)
+    # fs2_ff = conv_net(5, 1, [64,128,256, 128,64], activation='ReLU', in_spatial=2)
+
+    optimizer_surrogate_ff = adam(surrogate_ff)
+    optimizer_surrogate_ff2 = adam(surrogate_ff2)
+    optimizer_ss_ff = adam(ss_ff)
+    optimizer_bs_ff = adam(bs_ff)
+    optimizer_bss_ff = adam(bss_ff)
+    optimizer_fs_ff = adam(fs_ff, learning_rate=1.41e-04)
+    # optimizer_fs2_ff = adam(fs2_ff, learning_rate=1.41e-04)
+
+    # def training_loss(X):
+    #     predicted = math.native_call(surrogate_ff, X)
+    #     return math.l2_loss(predicted - config_loss), X, predicted
+
+    def training_loss_surrogate_ff(X):
+        predicted = math.native_call(surrogate_ff, X)
+        return math.l2_loss(predicted - config_loss), X, predicted
+
+    def training_loss_surrogate_ff2(X):
+        predicted = math.native_call(surrogate_ff2, X)
+        return math.l2_loss(predicted - config_loss), X, predicted
+
+
+    def training_loss_ss_ff(X):
+        predicted = math.native_call(ss_ff, X)
+        return math.l2_loss(predicted - config_loss), X, predicted
+
+    def training_loss_bs_ff(X):
+        predicted = math.native_call(bs_ff, X)
+        loss_scale = math.where(predicted > config_loss, skew_scale_high, skew_scale_low)
+        return math.l2_loss(predicted - config_loss)*loss_scale, X, predicted
+
+    def training_loss_bss_ff(X):
+        predicted = math.native_call(bss_ff, X)
+        loss_scale = math.where(predicted > config_loss, skew_scale_high, skew_scale_low)
+        return math.l2_loss(predicted - config_loss)*loss_scale, X, predicted
+    #
+    def predict_loss(x):
+        prediction = math.mean(math.native_call(fs_ff, x))
+        return prediction
+    #
+    # def predict_loss2(x):
+    #     prediction = math.mean(math.native_call(fs2_ff, x))
+    #     return prediction
+    #
+    prediction_and_grad = math.functional_gradient(predict_loss,  'x', get_output=True)
+    # prediction_and_grad2 = math.functional_gradient(predict_loss2,  'x', get_output=True)
+    #
+    #
+    def loss_function_flat(X):
+        prediction, dx = prediction_and_grad(X)
+        loss_normal = math.l2_loss(prediction - config_loss)
+        # loss_factor = math.where(prediction > test(X), 2.7, 0.1)
+        loss_reg = 0.1*math.l2_loss(dx.features[4])
+        # math.print(loss_reg)
+        return loss_normal + loss_reg, loss_normal, loss_reg
+    #
+    # def loss_function_flat2(X):
+    #     prediction, dx = prediction_and_grad2(X)
+    #     loss_normal = math.l2_loss(prediction - config_loss)
+    #     # loss_factor = math.where(prediction > test(X), 2.7, 0.1)
+    #     loss_reg = 0.1*math.l2_loss(dx.features[4])
+    #     # math.print(loss_reg)
+    #     return loss_normal + loss_reg, loss_normal, loss_reg
+    #
+    #
+    load_state(surrogate_ff, './surrogate_ff_05112023.pth')
+    load_state(surrogate_ff2, './surrogate_ff2_05112023.pth')
+    # load_state(ss_ff, './ss_ff_05112023.pth')
+    load_state(bs_ff, './bs_ff_05112023.pth')
+    # load_state(bss_ff, './bss_ff_05112023.pth')
+    load_state(fs_ff, './fs_ff_05112023.pth')
+    #
+    # for steps in range(num_train_steps):
+    #     batch_size=128
+    #     x0 = vec(x=0.4, y=pos_y)
+    #     x_init = x0
+    #     balls = billiards_triangle()
+    #     cue_ball = Sphere(tensor([x_init], instance('balls'), channel(vector='x,y')), radius=.03)
+    #     all_balls = math.concat([cue_ball, balls], instance('balls'))
+    #     balls_v = PointCloud(balls, tensor([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], shape(balls)))
+    #     v0_speed = speed
+    #     v0_speed_train = speed
+    #     alpha = math.random_uniform(batch(b=batch_size), low=parm_1_min, high=parm_1_max)
+    #     alpha_train = math.random_uniform(batch(b=batch_size), low=parm_1_min, high=parm_1_max)
+    #     # print(f"alpha: {alpha}")
+    #     # print(f"alpha_train: {alpha_train}")
+    #     v0 = vec(x=v0_speed * math.cos(alpha), y=v0_speed * math.sin(alpha))
+    #     v0_train = vec(x=v0_speed_train * math.cos(alpha_train), y=v0_speed_train * math.sin(alpha_train))
+    #     noise = math.random_normal(batch(b=batch_size))
+    #     cue_ball_v = PointCloud(cue_ball, tensor([(v0)], shape(cue_ball)))
+    #     cue_ball_v_train = PointCloud(cue_ball, tensor([(v0_train)], shape(cue_ball)))
+    #     all_balls_v = math.concat([cue_ball_v, balls_v], instance('balls'))
+    #     all_balls_v_train = math.concat([cue_ball_v_train, balls_v], instance('balls'))
+    #     key_states, key_times = iterate(physics_step, spatial(keys=num_key_states), all_balls_v, 0)
+    #     key_states_train, key_times_train = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_train, 0)
+    #     trj_ref, _ = sample_linear_trajectory(key_states, key_times, spatial(t=num_trj_frames))
+    #     trj_train, _ = sample_linear_trajectory(key_states_train, key_times_train, spatial(t=num_trj_frames))  # Batch dimension aate hi is line me problem hai
+    #     config_loss = math.l2_loss(trj_train.elements.center - trj_ref.elements.center)
+    #     input_pos = math.rename_dims(trj_ref.t[::2].elements.center, instance('balls'), spatial('balls'))
+    #     input_speed = math.rename_dims(trj_ref.t[::2].values, instance('balls'), spatial('balls'))
+    #     input_alpha = math.expand(alpha_train, shape(input_pos.vector[0]))
+    #     input_surrogate = math.stack([input_pos.vector[0], input_speed.vector[0], input_pos.vector[1],input_speed.vector[1], input_alpha], channel(features='input_pos_x,input_vel_x, input_pos_y,input_vel_y, input_alpha'))
+    #     input_ss = math.stack([input_pos.vector[0], input_speed.vector[0], input_pos.vector[1],input_speed.vector[1], input_alpha + noise_scale*noise], channel(features='input_pos_x, input_vel_x, input_pos_y,input_vel_y, input_alpha'))
+    #     sin_features_ff = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 4))
+    #     cos_features_ff = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 4))
+    #     input_surrogate_ff = math.stack(
+    #         [sin_features_ff.f_features[0], cos_features_ff.f_features[0], sin_features_ff.f_features[1],
+    #          cos_features_ff.f_features[1], sin_features_ff.f_features[2], cos_features_ff.f_features[2],
+    #          sin_features_ff.f_features[3],
+    #          cos_features_ff.f_features[3]],
+    #         channel(f_features='sin_f_1,cos_f_1, sin_f_2,cos_f_2,sin_f_3,cos_f_3, sin_f_4,cos_f_4'))
+    #     # sin_features_ff2 = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 8))
+    #     # cos_features_ff2 = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 8))
+    #     # input_surrogate_ff2 = math.stack(
+    #     #     [sin_features_ff2.f_features[0], cos_features_ff2.f_features[0], sin_features_ff2.f_features[1],
+    #     #      cos_features_ff2.f_features[1], sin_features_ff2.f_features[2], cos_features_ff2.f_features[2],
+    #     #      sin_features_ff2.f_features[3],
+    #     #      cos_features_ff2.f_features[3], sin_features_ff2.f_features[4], cos_features_ff2.f_features[4],
+    #     #      sin_features_ff2.f_features[5],
+    #     #      cos_features_ff2.f_features[5], sin_features_ff2.f_features[6], cos_features_ff2.f_features[6],
+    #     #      sin_features_ff2.f_features[7],
+    #     #      cos_features_ff2.f_features[7]],
+    #     #     channel(
+    #     #         f_features='sin_f_1,cos_f_1, sin_f_2,cos_f_2,sin_f_3,cos_f_3, sin_f_4,cos_f_4,sin_f_5,cos_f_5, sin_f_6,cos_f_6,sin_f_7,cos_f_7, sin_f_8,cos_f_8'))
+    #     sin_features_ss_ff = math.sin(input_ss * 2 ** math.range(channel('f_features'), 4))
+    #     cos_features_ss_ff = math.sin(input_ss * 2 ** math.range(channel('f_features'), 4))
+    #     input_ss_ff = math.stack(
+    #         [sin_features_ss_ff.f_features[0], cos_features_ss_ff.f_features[0], sin_features_ss_ff.f_features[1],
+    #          cos_features_ss_ff.f_features[1], sin_features_ss_ff.f_features[2], cos_features_ss_ff.f_features[2],
+    #          sin_features_ss_ff.f_features[3],
+    #          cos_features_ss_ff.f_features[3]],
+    #         channel(f_features='sin_f_1,cos_f_1, sin_f_2,cos_f_2,sin_f_3,cos_f_3, sin_f_4,cos_f_4'))
+    #
+    #
+    #
+    #
+    #     # loss_surrogate, _, _ = update_weights(surrogate, optimizer_surrogate, training_loss, input_surrogate)
+    #     # loss_surrogate_ff, _, _ = update_weights(surrogate_ff, optimizer_surrogate_ff, training_loss_surrogate_ff, input_surrogate_ff)
+    #     # loss_surrogate_ff2, _, _ = update_weights(surrogate_ff2, optimizer_surrogate_ff2, training_loss_surrogate_ff2, input_surrogate_ff2)
+    #     loss_ss_ff, _, _ = update_weights(ss_ff, optimizer_ss_ff, training_loss_ss_ff, input_ss_ff)
+    #     loss_bs_ff, _, _ = update_weights(bs_ff, optimizer_bs_ff, training_loss_bs_ff, input_surrogate_ff)
+    #     loss_bss_ff, _, _ = update_weights(bss_ff, optimizer_bss_ff, training_loss_bss_ff, input_ss_ff)
+    #     loss_fs_ff,_,_ = update_weights(fs_ff, optimizer_fs_ff, loss_function_flat, input_surrogate_ff)
+    #     # loss_fs2_ff, _, _ = update_weights(fs2_ff, optimizer_fs2_ff, loss_function_flat2, input_surrogate_ff)
+    #
+    #
+    #     k = num_train_steps / 10
+    #     if steps % k == 0:
+    #         print(f"Physics_loss: {config_loss}")
+    #         print(f"Predicted_NN: {math.mean(math.native_call(ss_ff, input_surrogate_ff)),math.mean(math.native_call(bs_ff, input_surrogate_ff)),math.mean(math.native_call(bss_ff, input_surrogate_ff)),math.mean(math.native_call(fs_ff, input_surrogate_ff))}")
+    #         print(f"Training_loss_NN: {loss_ss_ff, loss_bs_ff, loss_bss_ff,loss_fs_ff}")
+    #         save_state(surrogate_ff, './surrogate_ff_05112023.pth')
+    #         save_state(surrogate_ff2, './surrogate_ff2_05112023.pth')
+    #         save_state(ss_ff, './ss_ff_05112023.pth')
+    #         save_state(bs_ff, './bs_ff_05112023.pth')
+    #         save_state(bss_ff, './bss_ff_05112023.pth')
+    #         save_state(fs_ff, './fs_ff_05112023.pth')
+    #
+    # save_state(surrogate_ff, './surrogate_ff_05112023.pth')
+    # save_state(surrogate_ff2, './surrogate_ff2_05112023.pth')
+    # save_state(ss_ff, './ss_ff_05112023.pth')
+    # save_state(bs_ff, './bs_ff_05112023.pth')
+    # save_state(bss_ff, './bss_ff_05112023.pth')
+    # save_state(fs_ff, './fs_ff_05112023.pth')
+
+    load_state(surrogate_ff, './surrogate_ff_05112023.pth')
+    load_state(surrogate_ff2, './surrogate_ff2_05112023.pth')
+    load_state(ss_ff, './ss_ff_05112023.pth')
+    load_state(bs_ff, './bs_ff_05112023.pth')
+    load_state(bss_ff, './bss_ff_05112023.pth')
+    load_state(fs_ff, './fs_ff_05112023.pth')
+
+
+    alpha_true = math.random_uniform(batch(b=2), low=parm_1_min, high=parm_1_max)
+    math.print(alpha_true)
+
+    v0_true = vec(x=speed * math.cos(alpha_true), y=speed * math.sin(alpha_true))
+    cue_ball_v_true = PointCloud(cue_ball, tensor([(v0_true)], shape(cue_ball)))
+    all_balls_v_true = math.concat([cue_ball_v_true, balls_v], instance('balls'))
+
+    key_states_true, key_times_true = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_true, 0)
+    trj_true, _ = sample_linear_trajectory(key_states_true, key_times_true, spatial(t=num_trj_frames))
+
+    def plot_fn(alpha):
+      v0_rand = vec(x=speed * math.cos(alpha), y=speed * math.sin(alpha))
+      cue_ball_v_rand = PointCloud(cue_ball, tensor([(v0_rand)], shape(cue_ball)))
+      all_balls_v_rand = math.concat([cue_ball_v_rand, balls_v], instance('balls'))
+      key_states_rand, key_times_rand = iterate(physics_step, spatial(keys=num_key_states), all_balls_v_rand, 0)
+      trj_rand, _ = sample_linear_trajectory(key_states_rand, key_times_rand, spatial(t=num_trj_frames))
+      input_pos = math.rename_dims(trj_true.t[::2].elements.center, instance('balls'), spatial('balls'))
+      input_speed = math.rename_dims(trj_true.t[::2].values, instance('balls'), spatial('balls'))
+      input_alpha = math.expand(alpha, shape(input_pos.vector[0]))
+      input_surrogate = math.stack([input_pos.vector[0], input_speed.vector[0], input_pos.vector[1],input_speed.vector[1], input_alpha], channel(features='input_pos_x,input_vel_x, input_pos_y,input_vel_y, input_alpha'))
+      sin_features_ff = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 4))
+      cos_features_ff = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 4))
+      input_surrogate_ff = math.stack(
+          [sin_features_ff.f_features[0], cos_features_ff.f_features[0], sin_features_ff.f_features[1],
+           cos_features_ff.f_features[1], sin_features_ff.f_features[2], cos_features_ff.f_features[2],
+           sin_features_ff.f_features[3],
+           cos_features_ff.f_features[3]],
+          channel(f_features='sin_f_1,cos_f_1, sin_f_2,cos_f_2,sin_f_3,cos_f_3, sin_f_4,cos_f_4'))
+      sin_features_ff2 = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 8))
+      cos_features_ff2 = math.sin(input_surrogate * 2 ** math.range(channel('f_features'), 8))
+      input_surrogate_ff2 = math.stack(
+          [sin_features_ff2.f_features[0], cos_features_ff2.f_features[0], sin_features_ff2.f_features[1],
+           cos_features_ff2.f_features[1], sin_features_ff2.f_features[2], cos_features_ff2.f_features[2],
+           sin_features_ff2.f_features[3],
+           cos_features_ff2.f_features[3], sin_features_ff2.f_features[4], cos_features_ff2.f_features[4],
+           sin_features_ff2.f_features[5],
+           cos_features_ff2.f_features[5], sin_features_ff2.f_features[6], cos_features_ff2.f_features[6],
+           sin_features_ff2.f_features[7],
+           cos_features_ff2.f_features[7]],
+          channel(
+              f_features='sin_f_1,cos_f_1, sin_f_2,cos_f_2,sin_f_3,cos_f_3, sin_f_4,cos_f_4,sin_f_5,cos_f_5, sin_f_6,cos_f_6,sin_f_7,cos_f_7, sin_f_8,cos_f_8'))
+
+      return math.l2_loss(trj_true.elements.center - trj_rand.elements.center), math.mean(math.native_call(surrogate_ff, input_surrogate_ff)),math.mean(math.native_call(surrogate_ff2, input_surrogate_ff2)), math.mean(math.native_call(ss_ff, input_surrogate_ff)), math.mean(math.native_call(bs_ff, input_surrogate_ff)), math.mean(math.native_call(bss_ff, input_surrogate_ff)),math.mean(math.native_call(fs_ff, input_surrogate_ff))
+
+    # show(CenteredGrid(lambda alpha: plot_fn(alpha)[3], alpha=300, bounds=Box(alpha=(parm_1_min,parm_1_max))))
+
+    # show(CenteredGrid(lambda alpha: math.stack({"Ground Truth Configuration loss": plot_fn(alpha)[0],"Surrogate": plot_fn(alpha)[1], "SS": plot_fn(alpha)[2], "Flat Surrogate": plot_fn(alpha)[3], "Flat Surrogate2": plot_fn(alpha)[4], "Flat Surrogate3": plot_fn(alpha)[5], "Flat Surrogate4": plot_fn(alpha)[6], "Flat Surrogate5": plot_fn(alpha)[7]}, channel('curves')), alpha=300, bounds=Box(alpha=(parm_1_min, parm_1_max))), size=(15,7), title='Network Outputs')
+
+
+    show(CenteredGrid(lambda alpha: math.stack({"Ground Truth Configuration loss": plot_fn(alpha)[0],"FF Surrogate": plot_fn(alpha)[1],"FF2 Surrogate": plot_fn(alpha)[2],"SS Surrogate": plot_fn(alpha)[3],"BS Surrogate": plot_fn(alpha)[4],"BSS Surrogate": plot_fn(alpha)[5],"FLAT Surrogate": plot_fn(alpha)[6]}, channel('curves')), alpha=1000, bounds=Box(alpha=(parm_1_min, parm_1_max))), size=(15,7), title='Network Outputs')
